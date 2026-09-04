@@ -1,0 +1,10 @@
+{
+  "name": "pi-local-share",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Serve the current pi session as HTML on the LAN for a limited time",
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
