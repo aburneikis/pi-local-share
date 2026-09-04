@@ -3,7 +3,7 @@ import { readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { promisify } from "node:util";
 
-const [sessionFile, slug, durationMs, host, stateFile, outputPath] = process.argv.slice(2);
+const [sessionFile, slug, durationMs, host, stateFile, outputPath, sessionName] = process.argv.slice(2);
 const EXPORT_CACHE_MS = 5_000;
 const run = promisify(execFile);
 
@@ -39,7 +39,7 @@ server.listen(0, "0.0.0.0", async () => {
 	const { port } = server.address();
 	const expiresAt = Date.now() + Number(durationMs);
 	const url = `http://${host}:${port}/${slug}`;
-	await writeFile(stateFile, JSON.stringify({ pid: process.pid, url, expiresAt }));
+	await writeFile(stateFile, JSON.stringify({ pid: process.pid, url, expiresAt, sessionFile, sessionName }));
 	setTimeout(shutdown, Number(durationMs));
 });
 

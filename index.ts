@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm } from "node:fs/promises";
 import { networkInterfaces, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +14,8 @@ interface ShareState {
 	pid: number;
 	url: string;
 	expiresAt: number;
+	sessionFile: string;
+	sessionName: string;
 }
 
 function parseDuration(text: string): number | undefined {
@@ -71,11 +73,30 @@ async function readState(stateFile: string): Promise<ShareState | undefined> {
 	return undefined;
 }
 
+async function listShares(): Promise<ShareState[]> {
+	let files: string[];
+	try {
+		files = await readdir(STATE_DIR);
+	} catch {
+		return [];
+	}
+	const states = await Promise.all(
+		files.filter((f) => f.endsWith(".json")).map((f) => readState(join(STATE_DIR, f))),
+	);
+	return states.filter((s): s is ShareState => s !== undefined).sort((a, b) => a.expiresAt - b.expiresAt);
+}
+
 async function stopShare(stateFile: string): Promise<boolean> {
 	const state = await readState(stateFile);
 	if (!state) return false;
 	process.kill(state.pid, "SIGTERM");
 	return true;
+}
+
+async function stopAllShares(): Promise<number> {
+	const shares = await listShares();
+	for (const share of shares) process.kill(share.pid, "SIGTERM");
+	return shares.length;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -103,10 +124,11 @@ export default function (pi: ExtensionAPI) {
 		const slug = randomBytes(6).toString("base64url");
 		const outputPath = join(STATE_DIR, `${slug}.html`);
 		const host = lanAddress() ?? "127.0.0.1";
+		const sessionName = pi.getSessionName() ?? basename(sessionFile, ".jsonl");
 
 		const child = spawn(
 			process.execPath,
-			[SERVER_SCRIPT, sessionFile, slug, String(durationMs), host, stateFile, outputPath],
+			[SERVER_SCRIPT, sessionFile, slug, String(durationMs), host, stateFile, outputPath, sessionName],
 			{ detached: true, stdio: "ignore" },
 		);
 		child.unref();
@@ -124,9 +146,9 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("lshare", {
-		description: `Serve this session as HTML on the LAN, survives pi exit. Usage: /lshare [duration|stop|status] (default ${DEFAULT_DURATION})`,
+		description: `Serve this session as HTML on the LAN, survives pi exit. Usage: /lshare [duration|stop|stop all|status] (default ${DEFAULT_DURATION})`,
 		getArgumentCompletions: (prefix) => {
-			const items = ["30m", "1h", "2h", "4h", "8h", "stop", "status"].map((v) => ({ value: v, label: v }));
+			const items = ["30m", "1h", "2h", "4h", "8h", "stop", "stop all", "status"].map((v) => ({ value: v, label: v }));
 			const filtered = items.filter((i) => i.value.startsWith(prefix));
 			return filtered.length > 0 ? filtered : null;
 		},
@@ -139,17 +161,27 @@ export default function (pi: ExtensionAPI) {
 			const stateFile = stateFileFor(sessionFile);
 			const arg = args.trim();
 
+			if (/^stop\s+all$/.test(arg)) {
+				const count = await stopAllShares();
+				ctx.ui.notify(count > 0 ? `Stopped ${count} share${count === 1 ? "" : "s"}` : "No active shares", "info");
+				return;
+			}
 			if (arg === "stop") {
 				const stopped = await stopShare(stateFile);
 				ctx.ui.notify(stopped ? "Local share stopped" : "No active share", "info");
 				return;
 			}
 			if (arg === "status") {
-				const state = await readState(stateFile);
-				ctx.ui.notify(
-					state ? `${state.url} expires in ${formatRemaining(state.expiresAt - Date.now())}` : "No active share",
-					"info",
-				);
+				const shares = await listShares();
+				if (shares.length === 0) {
+					ctx.ui.notify("No active shares", "info");
+					return;
+				}
+				const lines = shares.map((s) => {
+					const marker = s.sessionFile === sessionFile ? "* " : "  ";
+					return `${marker}${s.url}  ${formatRemaining(s.expiresAt - Date.now())} left  ${s.sessionName}`;
+				});
+				ctx.ui.notify(lines.join("\n"), "info");
 				return;
 			}
 			const durationMs = parseDuration(arg || DEFAULT_DURATION);
