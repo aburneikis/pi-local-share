@@ -2,6 +2,13 @@
 
 Serve the current pi session as HTML on your LAN instead of exporting a file or pushing to GitHub.
 
+## Security
+
+The server binds to `0.0.0.0` over plain HTTP with no authentication. Anyone on your
+network who has (or guesses) the URL can read the whole session transcript, including any
+secrets, file contents or command output it contains. Only use this on a network you trust,
+and stop the share when you are done.
+
 ## Install
 
 (cd to the dir)
