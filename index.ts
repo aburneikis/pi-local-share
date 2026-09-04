@@ -1,20 +1,19 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { readFile, rm } from "node:fs/promises";
-import { createServer, type Server } from "node:http";
+import { mkdir, readFile, rm } from "node:fs/promises";
 import { networkInterfaces, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const DEFAULT_DURATION = "1h";
-const EXPORT_CACHE_MS = 5_000;
+const STATE_DIR = join(tmpdir(), "pi-lshare");
+const SERVER_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "server.mjs");
 
-interface Share {
-	server: Server;
+interface ShareState {
+	pid: number;
 	url: string;
 	expiresAt: number;
-	timer: NodeJS.Timeout;
-	ticker: NodeJS.Timeout;
-	outputPath: string;
 }
 
 function parseDuration(text: string): number | undefined {
@@ -50,125 +49,105 @@ function lanAddress(): string | undefined {
 	return candidates[0]?.address;
 }
 
+function isAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function stateFileFor(sessionFile: string): string {
+	return join(STATE_DIR, `${basename(sessionFile, ".jsonl")}.json`);
+}
+
+async function readState(stateFile: string): Promise<ShareState | undefined> {
+	try {
+		const state = JSON.parse(await readFile(stateFile, "utf8")) as ShareState;
+		if (isAlive(state.pid) && state.expiresAt > Date.now()) return state;
+	} catch {}
+	await rm(stateFile, { force: true });
+	return undefined;
+}
+
+async function stopShare(stateFile: string): Promise<boolean> {
+	const state = await readState(stateFile);
+	if (!state) return false;
+	process.kill(state.pid, "SIGTERM");
+	return true;
+}
+
 export default function (pi: ExtensionAPI) {
-	let share: Share | undefined;
-
-	function stop(ctx: ExtensionCommandContext | { ui: { setStatus(key: string, text?: string): void } }) {
-		if (!share) return;
-		clearTimeout(share.timer);
-		clearInterval(share.ticker);
-		share.server.close();
-		void rm(share.outputPath, { force: true });
-		share = undefined;
-		ctx.ui.setStatus("lshare", undefined);
-	}
-
-	async function exportHtml(sessionFile: string, outputPath: string): Promise<string> {
-		const result = await pi.exec("pi", ["--export", sessionFile, outputPath], { timeout: 60_000 });
-		if (result.code !== 0) throw new Error(result.stderr || result.stdout || `pi --export exited ${result.code}`);
-		return readFile(outputPath, "utf8");
-	}
-
 	async function copyToClipboard(text: string): Promise<boolean> {
 		const result = await pi.exec("sh", ["-c", `printf %s "$1" | wl-copy`, "sh", text], { timeout: 3_000 });
 		return result.code === 0;
 	}
 
-	async function start(durationMs: number, ctx: ExtensionCommandContext) {
-		const sessionFile = ctx.sessionManager.getSessionFile();
-		if (!sessionFile) {
-			ctx.ui.notify("Cannot share an in-memory session", "error");
-			return;
+	async function waitForState(stateFile: string): Promise<ShareState> {
+		for (let i = 0; i < 100; i++) {
+			try {
+				return JSON.parse(await readFile(stateFile, "utf8")) as ShareState;
+			} catch {
+				await new Promise((r) => setTimeout(r, 100));
+			}
 		}
+		throw new Error("share server did not start");
+	}
 
-		stop(ctx);
+	async function start(durationMs: number, sessionFile: string, ctx: ExtensionCommandContext) {
+		const stateFile = stateFileFor(sessionFile);
+		await stopShare(stateFile);
+		await mkdir(STATE_DIR, { recursive: true });
 
 		const slug = randomBytes(6).toString("base64url");
-		const outputPath = join(tmpdir(), `pi-lshare-${slug}.html`);
+		const outputPath = join(STATE_DIR, `${slug}.html`);
+		const host = lanAddress() ?? "127.0.0.1";
 
-		let cached: { html: string; at: number } | undefined;
-		const getHtml = async () => {
-			if (cached && Date.now() - cached.at < EXPORT_CACHE_MS) return cached.html;
-			const html = await exportHtml(sessionFile, outputPath);
-			cached = { html, at: Date.now() };
-			return html;
-		};
+		const child = spawn(
+			process.execPath,
+			[SERVER_SCRIPT, sessionFile, slug, String(durationMs), host, stateFile, outputPath],
+			{ detached: true, stdio: "ignore" },
+		);
+		child.unref();
 
 		try {
-			await getHtml();
+			const state = await waitForState(stateFile);
+			const copied = await copyToClipboard(state.url);
+			ctx.ui.notify(
+				`Sharing on LAN for ${formatRemaining(durationMs)}: ${state.url}${copied ? " (copied)" : ""}`,
+				"info",
+			);
 		} catch (err) {
-			ctx.ui.notify(`Export failed: ${err instanceof Error ? err.message : String(err)}`, "error");
-			return;
+			ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
 		}
-
-		const server = createServer(async (req, res) => {
-			const path = (req.url ?? "/").split("?")[0];
-			if (path !== `/${slug}` && path !== `/${slug}/`) {
-				res.writeHead(404, { "Content-Type": "text/plain" }).end("Not found");
-				return;
-			}
-			try {
-				const html = await getHtml();
-				res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }).end(html);
-			} catch (err) {
-				res.writeHead(500, { "Content-Type": "text/plain" }).end(err instanceof Error ? err.message : String(err));
-			}
-		});
-
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(0, "0.0.0.0", () => resolve());
-		});
-
-		const address = server.address();
-		const port = typeof address === "object" && address ? address.port : 0;
-		const host = lanAddress() ?? "127.0.0.1";
-		const url = `http://${host}:${port}/${slug}`;
-		const expiresAt = Date.now() + durationMs;
-
-		const updateStatus = () => {
-			if (!share) return;
-			ctx.ui.setStatus("lshare", `share ${url} (${formatRemaining(share.expiresAt - Date.now())})`);
-		};
-
-		share = {
-			server,
-			url,
-			expiresAt,
-			outputPath,
-			timer: setTimeout(() => {
-				stop(ctx);
-				ctx.ui.notify("Local share expired", "info");
-			}, durationMs),
-			ticker: setInterval(updateStatus, 1_000),
-		};
-		updateStatus();
-
-		const copied = await copyToClipboard(url);
-		ctx.ui.notify(`Sharing on LAN for ${formatRemaining(durationMs)}: ${url}${copied ? " (copied)" : ""}`, "info");
 	}
 
 	pi.registerCommand("lshare", {
-		description: `Serve this session as HTML on the LAN. Usage: /lshare [duration|stop|status] (default ${DEFAULT_DURATION})`,
+		description: `Serve this session as HTML on the LAN, survives pi exit. Usage: /lshare [duration|stop|status] (default ${DEFAULT_DURATION})`,
 		getArgumentCompletions: (prefix) => {
 			const items = ["30m", "1h", "2h", "4h", "8h", "stop", "status"].map((v) => ({ value: v, label: v }));
 			const filtered = items.filter((i) => i.value.startsWith(prefix));
 			return filtered.length > 0 ? filtered : null;
 		},
 		handler: async (args, ctx) => {
+			const sessionFile = ctx.sessionManager.getSessionFile();
+			if (!sessionFile) {
+				ctx.ui.notify("Cannot share an in-memory session", "error");
+				return;
+			}
+			const stateFile = stateFileFor(sessionFile);
 			const arg = args.trim();
+
 			if (arg === "stop") {
-				if (!share) {
-					ctx.ui.notify("No active share", "info");
-					return;
-				}
-				stop(ctx);
-				ctx.ui.notify("Local share stopped", "info");
+				const stopped = await stopShare(stateFile);
+				ctx.ui.notify(stopped ? "Local share stopped" : "No active share", "info");
 				return;
 			}
 			if (arg === "status") {
+				const state = await readState(stateFile);
 				ctx.ui.notify(
-					share ? `${share.url} expires in ${formatRemaining(share.expiresAt - Date.now())}` : "No active share",
+					state ? `${state.url} expires in ${formatRemaining(state.expiresAt - Date.now())}` : "No active share",
 					"info",
 				);
 				return;
@@ -178,11 +157,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`Invalid duration "${arg}". Examples: 30m, 1h, 2h`, "error");
 				return;
 			}
-			await start(durationMs, ctx);
+			await start(durationMs, sessionFile, ctx);
 		},
-	});
-
-	pi.on("session_shutdown", async (_event, ctx) => {
-		stop(ctx);
 	});
 }
