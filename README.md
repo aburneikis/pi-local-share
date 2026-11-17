@@ -33,7 +33,10 @@ or symlink `index.ts` into `~/.pi/agent/extensions/`.
 ```
 
 The URL is `http://<lan-ip>:<random-port>/<random-slug>`, copied to the clipboard via `wl-copy`.
-The page is re-exported on each request (cached 5s), so teammates see the live session on refresh.
-The server stops when the time runs out or when pi exits.
+The page is a snapshot taken when you run `/lshare`, rendered with your current pi theme.
+Later messages are not shared; run `/lshare` again to replace the snapshot (new URL).
+
+The server runs as a detached process, so it keeps serving after pi exits or the terminal
+is closed. It stops when the time runs out or on `/lshare stop` / `/lshare stop all`.
 
 (wl-copy wont work on all systems, e.g. macOS)

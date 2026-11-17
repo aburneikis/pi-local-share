@@ -1,10 +1,11 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { mkdir, readdir, readFile, rm } from "node:fs/promises";
 import { networkInterfaces, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { basename, dirname, join, sep } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const DEFAULT_DURATION = "1h";
 const STATE_DIR = join(tmpdir(), "pi-lshare");
@@ -49,6 +50,18 @@ function lanAddress(): string | undefined {
 	const rank = (name: string) => (/^(wl|en|eth)/.test(name) ? 0 : 1);
 	candidates.sort((a, b) => rank(a.name) - rank(b.name));
 	return candidates[0]?.address;
+}
+
+// `pi --export` ignores the user's theme and renders with the black ANSI "system" theme,
+// and the themed exporter is not part of pi's public API, so load it from pi's dist dir.
+async function exportSnapshot(ctx: ExtensionCommandContext, outputPath: string): Promise<void> {
+	const cliPath = realpathSync(process.argv[1]);
+	const distDir = cliPath.slice(0, cliPath.lastIndexOf(`${sep}dist${sep}`) + `${sep}dist`.length);
+	const exporter = await import(pathToFileURL(join(distDir, "core", "export-html", "index.js")).href);
+	await exporter.exportSessionToHtml(ctx.sessionManager, undefined, {
+		outputPath,
+		themeName: ctx.ui.theme.name,
+	});
 }
 
 function isAlive(pid: number): boolean {
@@ -126,9 +139,16 @@ export default function (pi: ExtensionAPI) {
 		const host = lanAddress() ?? "127.0.0.1";
 		const sessionName = pi.getSessionName() ?? basename(sessionFile, ".jsonl");
 
+		try {
+			await exportSnapshot(ctx, outputPath);
+		} catch (err) {
+			ctx.ui.notify(`Export failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+			return;
+		}
+
 		const child = spawn(
 			process.execPath,
-			[SERVER_SCRIPT, sessionFile, slug, String(durationMs), host, stateFile, outputPath, sessionName],
+			[SERVER_SCRIPT, outputPath, slug, String(durationMs), host, stateFile, sessionFile, sessionName],
 			{ detached: true, stdio: "ignore" },
 		);
 		child.unref();
@@ -146,7 +166,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("lshare", {
-		description: `Serve this session as HTML on the LAN, survives pi exit. Usage: /lshare [duration|stop|stop all|status] (default ${DEFAULT_DURATION})`,
+		description: `Serve a snapshot of this session as HTML on the LAN, survives pi exit. Usage: /lshare [duration|stop|stop all|status] (default ${DEFAULT_DURATION})`,
 		getArgumentCompletions: (prefix) => {
 			const items = ["30m", "1h", "2h", "4h", "8h", "stop", "stop all", "status"].map((v) => ({ value: v, label: v }));
 			const filtered = items.filter((i) => i.value.startsWith(prefix));
